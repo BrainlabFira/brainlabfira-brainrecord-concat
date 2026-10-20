@@ -1,0 +1,16 @@
+{
+  "name": "timesheet-concat-service",
+  "version": "1.0.0",
+  "description": "Microservicio que concatena bajo demanda los chunks de un fichaje desde MinIO en un único MP4",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "express": "^4.21.0",
+    "minio": "^8.0.0",
+    "ws": "^8.18.0"
+  }
+}

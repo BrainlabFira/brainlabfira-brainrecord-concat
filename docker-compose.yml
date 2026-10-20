@@ -1,0 +1,37 @@
+services:
+  concat-service:
+    build: .
+    container_name: concat-service
+    restart: unless-stopped
+    ports:
+      - "9210:9200"
+    environment:
+      PORT: "9200"
+      # IMPORTANTE: para operaciones internas del servicio (listar, concatenar,
+      # subir el resultado) se usa el hostname interno 'minio:9000'.
+      MINIO_ENDPOINT: "minio"
+      MINIO_PORT: "9000"
+      # Credenciales desde .env (ignorado por git). Ver .env.example.
+      MINIO_ACCESS_KEY: "${MINIO_ACCESS_KEY:?falta MINIO_ACCESS_KEY en .env}"
+      MINIO_SECRET_KEY: "${MINIO_SECRET_KEY:?falta MINIO_SECRET_KEY en .env}"
+      MINIO_BUCKET: "recordings"
+      MINIO_USE_SSL: "false"
+      # Endpoint PÚBLICO para firmar las presigned URLs de subida (el PC del
+      # empleado debe poder alcanzarlo; no vale el hostname interno 'minio').
+      MINIO_PUBLIC_ENDPOINT: "192.168.1.175"
+      MINIO_PUBLIC_PORT: "9100"
+      MINIO_PUBLIC_USE_SSL: "false"
+      CONCAT_PREFIX: "concatenated"
+      # Supabase — para validar los JWT de la app de escritorio
+      SUPABASE_URL: "${SUPABASE_URL:?falta SUPABASE_URL en .env}"
+      SUPABASE_ANON_KEY: "${SUPABASE_ANON_KEY:?falta SUPABASE_ANON_KEY en .env}"
+      UPLOAD_URL_EXPIRY_SEC: "900"
+      # role_id de public.users que puede ver las grabaciones de TODOS.
+      # El resto de usuarios solo accede a su propia carpeta.
+      ADMIN_ROLE_ID: "${ADMIN_ROLE_ID:-1}"
+    networks:
+      - proxy
+
+networks:
+  proxy:
+    external: true

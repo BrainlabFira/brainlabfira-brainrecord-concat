@@ -1,0 +1,437 @@
+'use strict';
+
+const express = require('express');
+const Minio = require('minio');
+const { createClient } = require('@supabase/supabase-js');
+const WebSocket = require('ws');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
+
+// ── Config (env vars, mismos nombres que la app de escritorio) ──────────────
+const PORT = parseInt(process.env.PORT ?? '9200', 10);
+const MINIO_ENDPOINT = process.env.MINIO_ENDPOINT ?? '192.168.1.175';
+const MINIO_PORT = parseInt(process.env.MINIO_PORT ?? '9100', 10);
+const MINIO_ACCESS_KEY = process.env.MINIO_ACCESS_KEY ?? '';
+const MINIO_SECRET_KEY = process.env.MINIO_SECRET_KEY ?? '';
+const MINIO_BUCKET = process.env.MINIO_BUCKET ?? 'recordings';
+const MINIO_USE_SSL = process.env.MINIO_USE_SSL === 'true';
+
+// Prefijo donde se guardan los vídeos ya concatenados (caché en el mismo bucket)
+const CONCAT_PREFIX = process.env.CONCAT_PREFIX ?? 'concatenated';
+// ffmpeg: en el contenedor está en PATH; en local puedes apuntar a un binario
+const FFMPEG_PATH = process.env.FFMPEG_PATH ?? 'ffmpeg';
+
+// Supabase — para validar los JWT de la app de escritorio y mapear a numericUserId
+const SUPABASE_URL = process.env.SUPABASE_URL ?? '';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY ?? '';
+// Minutos de validez de las presigned URLs de subida
+const UPLOAD_URL_EXPIRY_SEC = parseInt(process.env.UPLOAD_URL_EXPIRY_SEC ?? '900', 10);
+
+const minio = new Minio.Client({
+  endPoint: MINIO_ENDPOINT,
+  port: MINIO_PORT,
+  useSSL: MINIO_USE_SSL,
+  accessKey: MINIO_ACCESS_KEY,
+  secretKey: MINIO_SECRET_KEY,
+});
+
+// Cliente aparte para FIRMAR las presigned URLs de subida con el endpoint PÚBLICO.
+// El cliente 'minio' de arriba usa el hostname interno (minio:9000) que la app del
+// empleado NO puede resolver. Las URLs firmadas deben apuntar al endpoint público
+// (p.ej. 192.168.1.175:9100) para que el PC del empleado pueda subir el chunk.
+const MINIO_PUBLIC_ENDPOINT = process.env.MINIO_PUBLIC_ENDPOINT ?? '192.168.1.175';
+const MINIO_PUBLIC_PORT = parseInt(process.env.MINIO_PUBLIC_PORT ?? '9100', 10);
+const MINIO_PUBLIC_USE_SSL = process.env.MINIO_PUBLIC_USE_SSL === 'true';
+
+const minioPublic = new Minio.Client({
+  endPoint: MINIO_PUBLIC_ENDPOINT,
+  port: MINIO_PUBLIC_PORT,
+  useSSL: MINIO_PUBLIC_USE_SSL,
+  accessKey: MINIO_ACCESS_KEY,
+  secretKey: MINIO_SECRET_KEY,
+});
+
+// No usamos Realtime aquí (solo auth.getUser + queries), pero createClient
+// instancia RealtimeClient igualmente, que necesita WebSocket (no nativo en Node 20).
+// Pasamos 'ws' como transport para que no falle al arrancar.
+const supabase = SUPABASE_URL && SUPABASE_ANON_KEY
+  ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+      realtime: { transport: WebSocket },
+    })
+  : null;
+
+const app = express();
+app.use(express.json());
+
+function log(...args) {
+  console.log(`[${new Date().toISOString()}]`, ...args);
+}
+
+// ── Auth: validar JWT de Supabase y mapear a numericUserId ──────────────────
+// Cache email → numericUserId (el mapeo no cambia; evita consultar en cada subida)
+const userIdCache = new Map();
+
+// Valida el JWT y devuelve el usuario de Supabase Auth (o null si inválido).
+async function getAuthUser(token) {
+  if (!supabase || !token) return null;
+  try {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) return null;
+    return data.user;
+  } catch {
+    return null;
+  }
+}
+
+// Mapea el email del usuario autenticado a su numericUserId de public.users.
+// Busca por company_email, con fallback a personal_email (igual que la app).
+async function resolveNumericUserId(email) {
+  if (!email) return null;
+  if (userIdCache.has(email)) return userIdCache.get(email);
+
+  let { data } = await supabase
+    .from('users')
+    .select('id')
+    .eq('company_email', email)
+    .maybeSingle();
+
+  if (!data) {
+    ({ data } = await supabase
+      .from('users')
+      .select('id')
+      .eq('personal_email', email)
+      .maybeSingle());
+  }
+
+  const id = data ? data.id : null;
+  if (id !== null) userIdCache.set(email, id);
+  return id;
+}
+
+// ── Rol: quién puede ver las grabaciones de OTROS ───────────────────────────
+// role_id = 1 en public.users es administrador. El resto solo ve lo suyo.
+//
+// Se comprueba AQUÍ y no en el cliente a propósito: ocultar una pestaña en la
+// app es cosmético — cualquiera con un token válido podría llamar al endpoint
+// igualmente. El control real tiene que estar en el servidor.
+const ADMIN_ROLE_ID = parseInt(process.env.ADMIN_ROLE_ID ?? '1', 10);
+
+// Cache email → { id, isAdmin }. El rol cambia muy de tanto en tanto, así que
+// se cachea con un TTL corto en vez de consultarlo en cada petición.
+const profileCache = new Map();
+const PROFILE_TTL_MS = 5 * 60 * 1000;
+
+async function resolveProfile(email) {
+  if (!email) return null;
+
+  const cached = profileCache.get(email);
+  if (cached && Date.now() - cached.at < PROFILE_TTL_MS) return cached.value;
+
+  let { data } = await supabase
+    .from('users')
+    .select('id, role_id')
+    .eq('company_email', email)
+    .maybeSingle();
+
+  if (!data) {
+    ({ data } = await supabase
+      .from('users')
+      .select('id, role_id')
+      .eq('personal_email', email)
+      .maybeSingle());
+  }
+
+  if (!data) return null;
+
+  const value = { id: data.id, isAdmin: data.role_id === ADMIN_ROLE_ID };
+  profileCache.set(email, { at: Date.now(), value });
+  return value;
+}
+
+// Resuelve el perfil a partir de la cabecera Authorization. Devuelve null si
+// el token no es válido o el usuario no está en public.users.
+async function authenticate(req) {
+  const token = (req.headers.authorization ?? '').replace(/^Bearer\s+/i, '');
+  const user = await getAuthUser(token);
+  if (!user) return null;
+  return resolveProfile(user.email);
+}
+
+// Lista las grabaciones (carpetas de tercer nivel) bajo un prefijo, con el
+// número de fragmentos y el tamaño total de cada una.
+//
+// La ruta es {userId}/{fecha}/{recId}/chunk_NNN.mp4, así que agrupamos por los
+// tres primeros segmentos. Se ignora el prefijo de los concatenados: son
+// resultados cacheados, no grabaciones en sí.
+function listRecordings(prefix) {
+  return new Promise((resolve, reject) => {
+    const groups = new Map();
+    const stream = minio.listObjectsV2(MINIO_BUCKET, prefix, true);
+
+    stream.on('data', (obj) => {
+      if (!obj.name.endsWith('.mp4')) return;
+      if (obj.name.startsWith(`${CONCAT_PREFIX}/`)) return;
+
+      const parts = obj.name.split('/');
+      if (parts.length < 4) return; // no tiene la forma esperada
+
+      const [userId, fecha, recId] = parts;
+      const key = `${userId}/${fecha}/${recId}`;
+
+      const g = groups.get(key) ?? {
+        userId, fecha, recId,
+        chunks: 0, bytes: 0, lastModified: null,
+      };
+      g.chunks++;
+      g.bytes += obj.size ?? 0;
+      const mod = obj.lastModified ? new Date(obj.lastModified) : null;
+      if (mod && (!g.lastModified || mod > g.lastModified)) g.lastModified = mod;
+      groups.set(key, g);
+    });
+
+    stream.on('error', reject);
+    stream.on('end', () => {
+      const list = Array.from(groups.values()).map((g) => ({
+        ...g,
+        lastModified: g.lastModified ? g.lastModified.toISOString() : null,
+      }));
+      // Más recientes primero.
+      list.sort((a, b) => (b.lastModified ?? '').localeCompare(a.lastModified ?? ''));
+      resolve(list);
+    });
+  });
+}
+
+// Lista los objetos de un prefijo, devueltos ordenados por nombre (chunk_001, 002…)
+function listChunks(prefix) {
+  return new Promise((resolve, reject) => {
+    const objects = [];
+    const stream = minio.listObjectsV2(MINIO_BUCKET, prefix, true);
+    stream.on('data', (obj) => {
+      if (obj.name.endsWith('.mp4')) objects.push(obj.name);
+    });
+    stream.on('error', reject);
+    stream.on('end', () => resolve(objects.sort()));
+  });
+}
+
+// Comprueba si un objeto existe (para servir el concatenado cacheado)
+async function objectExists(name) {
+  try {
+    await minio.statObject(MINIO_BUCKET, name);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Concatena los chunks sin recomprimir (-c copy) usando el demuxer concat de ffmpeg
+function ffmpegConcat(listFilePath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-y',
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', listFilePath,
+      '-c', 'copy',
+      '-movflags', '+faststart',
+      outputPath,
+    ];
+    const proc = spawn(FFMPEG_PATH, args);
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg salió con código ${code}: ${stderr.slice(-500)}`));
+    });
+  });
+}
+
+// ── Endpoint de subida: entrega una presigned URL para subir un chunk ────────
+// POST /upload-url   { "objectName": "6/2026-06-18/306/chunk_005.mp4" }
+// Header: Authorization: Bearer <jwt de Supabase>
+// La app NO tiene credenciales de MinIO: pide aquí una URL firmada temporal.
+// Seguridad estricta: el usuario solo puede subir a SU propia carpeta ({numericUserId}/...).
+app.post('/upload-url', async (req, res) => {
+  if (!supabase) {
+    return res.status(503).json({ error: 'Servicio de auth no configurado' });
+  }
+
+  const auth = req.headers.authorization ?? '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  const objectName = req.body?.objectName;
+
+  if (!token) return res.status(401).json({ error: 'Falta token' });
+  if (!objectName || typeof objectName !== 'string') {
+    return res.status(400).json({ error: 'Falta objectName' });
+  }
+
+  // Solo se permiten claves de la forma {userId}/{fecha}/{fichajeId}/chunk_NNN.mp4
+  // sin '..' ni caracteres raros (evita path traversal / sobrescribir otras rutas).
+  if (!/^\d+\/[\w-]+\/[\w-]+\/chunk_\d+\.mp4$/.test(objectName)) {
+    return res.status(400).json({ error: 'objectName con formato inválido' });
+  }
+
+  // 1. Validar el JWT
+  const user = await getAuthUser(token);
+  if (!user) return res.status(401).json({ error: 'Token inválido o expirado' });
+
+  // 2. Mapear a numericUserId
+  const numericUserId = await resolveNumericUserId(user.email);
+  if (numericUserId === null) {
+    return res.status(403).json({ error: 'Usuario no encontrado en public.users' });
+  }
+
+  // 3. Comprobar que la carpeta del objeto es la suya
+  const objectUserId = objectName.split('/')[0];
+  if (objectUserId !== String(numericUserId)) {
+    log(`[upload-url] RECHAZADO: ${user.email} (id ${numericUserId}) intentó subir a ${objectName}`);
+    return res.status(403).json({ error: 'No puedes subir a la carpeta de otro usuario' });
+  }
+
+  try {
+    // 4. Generar presigned PUT URL temporal (con el endpoint público)
+    const url = await minioPublic.presignedPutObject(MINIO_BUCKET, objectName, UPLOAD_URL_EXPIRY_SEC);
+    log(`[upload-url] OK ${user.email} → ${objectName} (expira ${UPLOAD_URL_EXPIRY_SEC}s)`);
+    return res.json({ url, expiresInSec: UPLOAD_URL_EXPIRY_SEC });
+  } catch (err) {
+    log('[upload-url] ERROR:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Listado de grabaciones ──────────────────────────────────────────────────
+// GET /recordings          → las del usuario autenticado
+// GET /recordings?all=1    → las de TODOS (solo administradores)
+// Header: Authorization: Bearer <jwt de Supabase>
+app.get('/recordings', async (req, res) => {
+  const profile = await authenticate(req);
+  if (!profile) return res.status(401).json({ error: 'No autenticado' });
+
+  const wantsAll = req.query.all === '1';
+  if (wantsAll && !profile.isAdmin) {
+    return res.status(403).json({ error: 'Solo los administradores pueden ver todas las grabaciones' });
+  }
+
+  // Sin ?all, cada uno ve lo suyo: el prefijo lo fija el servidor a partir del
+  // JWT, así que no hay forma de pedir la carpeta de otro.
+  const prefix = wantsAll ? '' : `${profile.id}/`;
+
+  try {
+    const recordings = await listRecordings(prefix);
+    res.json({ isAdmin: profile.isAdmin, userId: profile.id, recordings });
+  } catch (err) {
+    log('Error listando grabaciones:', err.message);
+    res.status(500).json({ error: 'No se pudieron listar las grabaciones' });
+  }
+});
+
+// ── Endpoint principal ──────────────────────────────────────────────────────
+// GET /concat/:userId/:fecha/:fichajeId
+//   ?force=1   → re-concatena aunque exista en caché
+//   ?download=1 → fuerza descarga (Content-Disposition attachment)
+//
+// Requiere autenticación: antes era público, así que cualquiera en la red que
+// adivinara la ruta podía descargar la grabación de cualquier empleado.
+app.get('/concat/:userId/:fecha/:fichajeId', async (req, res) => {
+  const { userId, fecha, fichajeId } = req.params;
+  const force = req.query.force === '1';
+  const download = req.query.download === '1';
+
+  // Validación básica para evitar path traversal
+  if ([userId, fecha, fichajeId].some((p) => /[^\w-]/.test(p))) {
+    return res.status(400).json({ error: 'Parámetros inválidos' });
+  }
+
+  // El token puede venir por cabecera (app) o por query (un <video src> del
+  // navegador no puede poner cabeceras).
+  const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
+  if (queryToken && !req.headers.authorization) {
+    req.headers.authorization = `Bearer ${queryToken}`;
+  }
+
+  const profile = await authenticate(req);
+  if (!profile) return res.status(401).json({ error: 'No autenticado' });
+
+  // Aislamiento: solo tus grabaciones, salvo que seas administrador.
+  if (String(profile.id) !== String(userId) && !profile.isAdmin) {
+    return res.status(403).json({ error: 'No puedes acceder a grabaciones de otro usuario' });
+  }
+
+  const sourcePrefix = `${userId}/${fecha}/${fichajeId}/`;
+  const outputObject = `${CONCAT_PREFIX}/${userId}/${fecha}/${fichajeId}.mp4`;
+
+  try {
+    // 1. Si ya está concatenado y no se fuerza, sírvelo directamente
+    if (!force && (await objectExists(outputObject))) {
+      log(`Cache hit: ${outputObject}`);
+      return streamObject(res, outputObject, download, `${fichajeId}.mp4`);
+    }
+
+    // 2. Listar chunks del fichaje
+    const chunks = await listChunks(sourcePrefix);
+    if (chunks.length === 0) {
+      return res.status(404).json({ error: `No hay chunks en ${sourcePrefix}` });
+    }
+    log(`Concatenando ${chunks.length} chunks de ${sourcePrefix}`);
+
+    // 3. Descargar chunks a un dir temporal
+    const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'concat-'));
+    try {
+      const localPaths = [];
+      for (let i = 0; i < chunks.length; i++) {
+        const local = path.join(workDir, `chunk_${String(i).padStart(4, '0')}.mp4`);
+        await minio.fGetObject(MINIO_BUCKET, chunks[i], local);
+        localPaths.push(local);
+      }
+
+      // 4. Crear lista para el demuxer concat
+      const listFile = path.join(workDir, 'list.txt');
+      fs.writeFileSync(
+        listFile,
+        localPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n')
+      );
+
+      // 5. Concatenar (sin recomprimir)
+      const outputLocal = path.join(workDir, 'output.mp4');
+      await ffmpegConcat(listFile, outputLocal);
+
+      // 6. Subir el resultado a MinIO (caché) y servirlo
+      await minio.fPutObject(MINIO_BUCKET, outputObject, outputLocal, {
+        'Content-Type': 'video/mp4',
+      });
+      log(`Concatenado y cacheado: ${outputObject}`);
+
+      return streamObject(res, outputObject, download, `${fichajeId}.mp4`);
+    } finally {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    }
+  } catch (err) {
+    log('ERROR:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Hace streaming de un objeto de MinIO hacia la respuesta HTTP
+async function streamObject(res, objectName, download, filename) {
+  const stat = await minio.statObject(MINIO_BUCKET, objectName);
+  res.setHeader('Content-Type', 'video/mp4');
+  res.setHeader('Content-Length', stat.size);
+  if (download) {
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  }
+  const stream = await minio.getObject(MINIO_BUCKET, objectName);
+  stream.pipe(res);
+}
+
+// Healthcheck
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+app.listen(PORT, () => {
+  log(`Concat service escuchando en puerto ${PORT}`);
+  log(`MinIO: ${MINIO_ENDPOINT}:${MINIO_PORT} bucket=${MINIO_BUCKET}`);
+});
