@@ -620,6 +620,15 @@ async function streamObject(res, objectName, download, filename, req) {
 // grabación de pantalla no debería poder bajarla cualquiera que pase por la red.
 const RELEASES_PREFIX = process.env.RELEASES_PREFIX ?? 'releases';
 
+// Clave para la descarga inicial. El JWT no sirve aquí: solo existe DESPUÉS de
+// instalar la app y hacer login, así que exigirlo haría imposible la primera
+// instalación.
+//
+// No es seguridad real —quien tenga el enlace descarga—, pero el instalador no
+// contiene secretos: sin credenciales de la intranet no graba, no sube y no lee
+// nada. El control de acceso de verdad está en el login, no en la descarga.
+const DOWNLOAD_KEY = process.env.DOWNLOAD_KEY ?? '';
+
 async function authenticateDownload(req, res) {
   const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
   if (queryToken && !req.headers.authorization) {
@@ -672,7 +681,14 @@ app.get('/updates/:file', async (req, res) => {
 // Atajo para la descarga inicial: resuelve el instalador de la última versión
 // leyendo el manifiesto, para no tener que saber el número de versión.
 app.get('/download', async (req, res) => {
-  if (!(await authenticateDownload(req, res))) return;
+  // Vale la clave de descarga o un JWT: lo primero para instalar por primera
+  // vez, lo segundo para que la app pueda ofrecer el enlace desde dentro.
+  const key = typeof req.query.key === 'string' ? req.query.key : '';
+  const keyOk = Boolean(DOWNLOAD_KEY) && key === DOWNLOAD_KEY;
+
+  if (!keyOk) {
+    if (!(await authenticateDownload(req, res))) return;
+  }
 
   try {
     const manifest = `${RELEASES_PREFIX}/latest.yml`;

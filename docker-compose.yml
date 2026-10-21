@@ -29,6 +29,8 @@ services:
       # role_id de public.users que puede ver las grabaciones de TODOS.
       # El resto de usuarios solo accede a su propia carpeta.
       ADMIN_ROLE_ID: "${ADMIN_ROLE_ID:-1}"
+      # Clave del enlace de descarga del instalador (ver .env.example)
+      DOWNLOAD_KEY: "${DOWNLOAD_KEY:-}"
     networks:
       - proxy
 
