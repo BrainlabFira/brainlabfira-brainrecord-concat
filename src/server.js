@@ -292,6 +292,37 @@ function ffmpegConcat(listFilePath, outputPath) {
   });
 }
 
+// Mezcla los dos canales de audio a mono, dejando el vídeo intacto (-c:v copy).
+//
+// La app graba el micrófono en el canal izquierdo y el audio del sistema en el
+// derecho, lo que permite separarlos luego para transcribir. Pero escuchar ese
+// fichero tal cual es incómodo: cada parte suena por un auricular, y si en la
+// grabación nadie habló al micro, el lado izquierdo está mudo.
+//
+// Por eso se sirve una versión mezclada. El original NO se toca: sigue en
+// MinIO con los canales separados, que es lo que necesita la transcripción.
+function ffmpegMixDown(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-y',
+      '-i', inputPath,
+      '-c:v', 'copy',           // el vídeo no se recomprime
+      '-af', 'pan=stereo|c0=c0+c1|c1=c0+c1',
+      '-c:a', 'aac', '-b:a', '128k',
+      '-movflags', '+faststart',
+      outputPath,
+    ];
+    const proc = spawn(FFMPEG_PATH, args);
+    let stderr = '';
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(`ffmpeg (mixdown) salió con código ${code}: ${stderr.slice(-500)}`));
+    });
+  });
+}
+
 // ── Endpoint de subida: entrega una presigned URL para subir un chunk ────────
 // POST /upload-url   { "objectName": "6/2026-06-18/306/chunk_005.mp4" }
 // Header: Authorization: Bearer <jwt de Supabase>
@@ -436,11 +467,36 @@ app.get('/concat/:userId/:fecha/:fichajeId', async (req, res) => {
   const sourcePrefix = `${userId}/${fecha}/${fichajeId}/`;
   const outputObject = `${CONCAT_PREFIX}/${userId}/${fecha}/${fichajeId}.mp4`;
 
+  // Por defecto se sirve la versión mezclada, que es la que se escucha bien.
+  // Con ?raw=1 se entrega el original con los canales separados, que es lo que
+  // necesita el pipeline de transcripción.
+  const raw = req.query.raw === '1';
+  const mixedObject = `${CONCAT_PREFIX}/${userId}/${fecha}/${fichajeId}_mix.mp4`;
+  const servedObject = raw ? outputObject : mixedObject;
+
   try {
-    // 1. Si ya está concatenado y no se fuerza, sírvelo directamente
-    if (!force && (await objectExists(outputObject))) {
-      log(`Cache hit: ${outputObject}`);
-      return streamObject(res, outputObject, download, `${fichajeId}.mp4`, req);
+    // 1. Si ya está en caché y no se fuerza, sírvelo directamente
+    if (!force && (await objectExists(servedObject))) {
+      log(`Cache hit: ${servedObject}`);
+      return streamObject(res, servedObject, download, `${fichajeId}.mp4`, req);
+    }
+
+    // 1b. El concatenado existe pero falta su versión mezclada (p. ej. una
+    // grabación anterior a este cambio): se genera solo la mezcla, sin
+    // repetir la concatenación.
+    if (!raw && !force && (await objectExists(outputObject))) {
+      const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mix-'));
+      try {
+        const src = path.join(workDir, 'src.mp4');
+        const out = path.join(workDir, 'mix.mp4');
+        await minio.fGetObject(MINIO_BUCKET, outputObject, src);
+        await ffmpegMixDown(src, out);
+        await minio.fPutObject(MINIO_BUCKET, mixedObject, out, { 'Content-Type': 'video/mp4' });
+        log(`Mezcla generada: ${mixedObject}`);
+        return streamObject(res, mixedObject, download, `${fichajeId}.mp4`, req);
+      } finally {
+        fs.rmSync(workDir, { recursive: true, force: true });
+      }
     }
 
     // 2. Listar chunks del fichaje
@@ -471,13 +527,22 @@ app.get('/concat/:userId/:fecha/:fichajeId', async (req, res) => {
       const outputLocal = path.join(workDir, 'output.mp4');
       await ffmpegConcat(listFile, outputLocal);
 
-      // 6. Subir el resultado a MinIO (caché) y servirlo
+      // 6. Subir el original (canales separados) a MinIO como caché
       await minio.fPutObject(MINIO_BUCKET, outputObject, outputLocal, {
         'Content-Type': 'video/mp4',
       });
       log(`Concatenado y cacheado: ${outputObject}`);
 
-      return streamObject(res, outputObject, download, `${fichajeId}.mp4`, req);
+      // 7. Y la versión mezclada, que es la que se sirve para escuchar. El
+      // vídeo se copia sin recomprimir, así que cuesta poco.
+      const mixLocal = path.join(workDir, 'mix.mp4');
+      await ffmpegMixDown(outputLocal, mixLocal);
+      await minio.fPutObject(MINIO_BUCKET, mixedObject, mixLocal, {
+        'Content-Type': 'video/mp4',
+      });
+      log(`Mezcla cacheada: ${mixedObject}`);
+
+      return streamObject(res, servedObject, download, `${fichajeId}.mp4`, req);
     } finally {
       fs.rmSync(workDir, { recursive: true, force: true });
     }
