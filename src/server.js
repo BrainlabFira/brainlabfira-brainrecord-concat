@@ -607,6 +607,105 @@ async function streamObject(res, objectName, download, filename, req) {
   stream.pipe(res);
 }
 
+// ── Distribución de la app de escritorio ────────────────────────────────────
+// Los instaladores y el manifiesto de actualización viven en un prefijo aparte
+// del bucket, subidos a mano con `npm run publish` desde el proyecto de la app.
+//
+//   releases/latest.yml                        ← manifiesto que lee la app
+//   releases/Brainlabrecord Setup 1.0.0.exe    ← instalador
+//
+// La app usa `autoUpdater.addAuthHeader()`, así que las peticiones llegan con
+// Authorization normal. Se acepta además el token por query para poder pegar
+// el enlace de descarga en un navegador. Sin token se rechaza: una app de
+// grabación de pantalla no debería poder bajarla cualquiera que pase por la red.
+const RELEASES_PREFIX = process.env.RELEASES_PREFIX ?? 'releases';
+
+async function authenticateDownload(req, res) {
+  const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
+  if (queryToken && !req.headers.authorization) {
+    req.headers.authorization = `Bearer ${queryToken}`;
+  }
+  const profile = await authenticate(req);
+  if (!profile) {
+    res.status(401).json({ error: 'No autenticado' });
+    return null;
+  }
+  return profile;
+}
+
+// Sirve cualquier fichero del prefijo de releases: el manifiesto, el instalador
+// y los .blockmap que electron-updater usa para descargas diferenciales.
+app.get('/updates/:file', async (req, res) => {
+  if (!(await authenticateDownload(req, res))) return;
+
+  const file = req.params.file;
+  // Sin barras ni '..': el nombre viaja en la URL y acaba en una clave de MinIO.
+  if (file.includes('/') || file.includes('\\') || file.includes('..')) {
+    return res.status(400).json({ error: 'Nombre de archivo inválido' });
+  }
+
+  const objectName = `${RELEASES_PREFIX}/${file}`;
+  if (!(await objectExists(objectName))) {
+    return res.status(404).json({ error: `No existe ${file}` });
+  }
+
+  try {
+    const stat = await minio.statObject(MINIO_BUCKET, objectName);
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader(
+      'Content-Type',
+      file.endsWith('.yml') ? 'text/yaml' : 'application/octet-stream'
+    );
+    // El manifiesto no se cachea: es justo lo que hay que releer para saber si
+    // hay versión nueva.
+    if (file.endsWith('.yml')) res.setHeader('Cache-Control', 'no-cache');
+
+    const stream = await minio.getObject(MINIO_BUCKET, objectName);
+    stream.pipe(res);
+  } catch (err) {
+    log('Error sirviendo update:', err.message);
+    res.status(500).json({ error: 'No se pudo servir el archivo' });
+  }
+});
+
+// Atajo para la descarga inicial: resuelve el instalador de la última versión
+// leyendo el manifiesto, para no tener que saber el número de versión.
+app.get('/download', async (req, res) => {
+  if (!(await authenticateDownload(req, res))) return;
+
+  try {
+    const manifest = `${RELEASES_PREFIX}/latest.yml`;
+    if (!(await objectExists(manifest))) {
+      return res.status(404).json({ error: 'No hay ninguna versión publicada' });
+    }
+
+    // latest.yml es YAML sencillo generado por electron-builder; basta con
+    // sacar la línea 'path:' en vez de añadir una dependencia de YAML.
+    const chunks = [];
+    const stream = await minio.getObject(MINIO_BUCKET, manifest);
+    for await (const c of stream) chunks.push(c);
+    const yml = Buffer.concat(chunks).toString('utf-8');
+
+    const match = /^path:\s*(.+)$/m.exec(yml);
+    if (!match) {
+      return res.status(500).json({ error: 'El manifiesto no indica el instalador' });
+    }
+    const file = match[1].trim().replace(/^["']|["']$/g, '');
+
+    const objectName = `${RELEASES_PREFIX}/${file}`;
+    const stat = await minio.statObject(MINIO_BUCKET, objectName);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Content-Disposition', `attachment; filename="${file}"`);
+    const dl = await minio.getObject(MINIO_BUCKET, objectName);
+    dl.pipe(res);
+  } catch (err) {
+    log('Error en /download:', err.message);
+    res.status(500).json({ error: 'No se pudo servir el instalador' });
+  }
+});
+
 // Healthcheck
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
