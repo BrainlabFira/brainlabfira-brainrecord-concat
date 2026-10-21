@@ -160,6 +160,47 @@ async function authenticate(req) {
   return resolveProfile(user.email);
 }
 
+// ── Nombres de usuario ──────────────────────────────────────────────────────
+// Un listado de admin puede traer decenas de grabaciones de muchos usuarios.
+// Resolver el nombre de uno en uno serían decenas de consultas, así que se
+// piden todos los id de golpe con un .in().
+const nameCache = new Map();
+const NAME_TTL_MS = 10 * 60 * 1000;
+
+function fullName(row) {
+  return [row.user_name, row.user_surname_1, row.user_surname_2]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+}
+
+async function resolveUserNames(ids) {
+  const result = new Map();
+  const missing = [];
+
+  for (const id of ids) {
+    const hit = nameCache.get(String(id));
+    if (hit && Date.now() - hit.at < NAME_TTL_MS) result.set(String(id), hit.name);
+    else missing.push(id);
+  }
+
+  if (missing.length > 0 && supabase) {
+    const { data } = await supabase
+      .from('users')
+      .select('id, user_name, user_surname_1, user_surname_2, company_email')
+      .in('id', missing);
+
+    for (const row of data ?? []) {
+      // Si no hay nombre, el email es mejor etiqueta que un número suelto.
+      const name = fullName(row) || row.company_email || `Usuario ${row.id}`;
+      nameCache.set(String(row.id), { at: Date.now(), name });
+      result.set(String(row.id), name);
+    }
+  }
+
+  return result;
+}
+
 // Lista las grabaciones (carpetas de tercer nivel) bajo un prefijo, con el
 // número de fragmentos y el tamaño total de cada una.
 //
@@ -323,7 +364,37 @@ app.get('/recordings', async (req, res) => {
 
   try {
     const recordings = await listRecordings(prefix);
-    res.json({ isAdmin: profile.isAdmin, userId: profile.id, recordings });
+
+    // Añadir el nombre de cada usuario: un "Usuario 6" no le dice nada a quien
+    // revisa las grabaciones.
+    const ids = [...new Set(recordings.map((r) => r.userId))];
+    const names = await resolveUserNames(ids);
+    for (const r of recordings) {
+      r.userName = names.get(String(r.userId)) ?? `Usuario ${r.userId}`;
+    }
+
+    // Búsqueda por nombre, fecha o id de grabación. Se filtra AQUÍ y no en el
+    // cliente para que el listado de un admin con muchos usuarios no tenga que
+    // viajar entero en cada tecla.
+    const q = (req.query.q ?? '').toString().trim().toLowerCase();
+    const filtered = q
+      ? recordings.filter((r) =>
+          r.userName.toLowerCase().includes(q) ||
+          r.recId.toLowerCase().includes(q) ||
+          r.fecha.includes(q))
+      : recordings;
+
+    // Lista de usuarios con grabaciones, para el desplegable de filtro.
+    const users = ids
+      .map((id) => ({ id, name: names.get(String(id)) ?? `Usuario ${id}` }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+
+    res.json({
+      isAdmin: profile.isAdmin,
+      userId: profile.id,
+      users,
+      recordings: filtered,
+    });
   } catch (err) {
     log('Error listando grabaciones:', err.message);
     res.status(500).json({ error: 'No se pudieron listar las grabaciones' });
@@ -369,7 +440,7 @@ app.get('/concat/:userId/:fecha/:fichajeId', async (req, res) => {
     // 1. Si ya está concatenado y no se fuerza, sírvelo directamente
     if (!force && (await objectExists(outputObject))) {
       log(`Cache hit: ${outputObject}`);
-      return streamObject(res, outputObject, download, `${fichajeId}.mp4`);
+      return streamObject(res, outputObject, download, `${fichajeId}.mp4`, req);
     }
 
     // 2. Listar chunks del fichaje
@@ -406,7 +477,7 @@ app.get('/concat/:userId/:fecha/:fichajeId', async (req, res) => {
       });
       log(`Concatenado y cacheado: ${outputObject}`);
 
-      return streamObject(res, outputObject, download, `${fichajeId}.mp4`);
+      return streamObject(res, outputObject, download, `${fichajeId}.mp4`, req);
     } finally {
       fs.rmSync(workDir, { recursive: true, force: true });
     }
@@ -417,13 +488,56 @@ app.get('/concat/:userId/:fecha/:fichajeId', async (req, res) => {
 });
 
 // Hace streaming de un objeto de MinIO hacia la respuesta HTTP
-async function streamObject(res, objectName, download, filename) {
+// Sirve el objeto, con soporte de peticiones por rango (HTTP 206).
+//
+// El Range es lo que permite SALTAR por el vídeo en un reproductor: sin él, el
+// navegador solo puede descargar el archivo entero desde el principio, así que
+// mover la barra a la mitad de una grabación de una hora no funciona.
+// `req` llega para leer la cabecera Range.
+async function streamObject(res, objectName, download, filename, req) {
   const stat = await minio.statObject(MINIO_BUCKET, objectName);
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Length', stat.size);
+  const total = stat.size;
+
   if (download) {
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   }
+  res.setHeader('Content-Type', 'video/mp4');
+  // Anunciar que aceptamos rangos; sin esto el reproductor ni lo intenta.
+  res.setHeader('Accept-Ranges', 'bytes');
+
+  const range = req?.headers?.range;
+  const match = range ? /^bytes=(\d*)-(\d*)$/.exec(range.trim()) : null;
+
+  if (match) {
+    let start = match[1] === '' ? null : parseInt(match[1], 10);
+    let end = match[2] === '' ? null : parseInt(match[2], 10);
+
+    // "bytes=-500" = los últimos 500 bytes.
+    if (start === null) {
+      if (end === null) return res.status(416).end();
+      start = Math.max(0, total - end);
+      end = total - 1;
+    } else if (end === null) {
+      end = total - 1;
+    }
+
+    if (start >= total || start > end) {
+      res.setHeader('Content-Range', `bytes */${total}`);
+      return res.status(416).end();
+    }
+    end = Math.min(end, total - 1);
+
+    res.status(206);
+    res.setHeader('Content-Range', `bytes ${start}-${end}/${total}`);
+    res.setHeader('Content-Length', end - start + 1);
+
+    const partial = await minio.getPartialObject(
+      MINIO_BUCKET, objectName, start, end - start + 1
+    );
+    return partial.pipe(res);
+  }
+
+  res.setHeader('Content-Length', total);
   const stream = await minio.getObject(MINIO_BUCKET, objectName);
   stream.pipe(res);
 }
