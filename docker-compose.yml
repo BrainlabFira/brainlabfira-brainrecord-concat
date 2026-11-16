@@ -31,6 +31,10 @@ services:
       ADMIN_ROLE_ID: "${ADMIN_ROLE_ID:-1}"
       # Clave del enlace de descarga del instalador (ver .env.example)
       DOWNLOAD_KEY: "${DOWNLOAD_KEY:-}"
+      # AI Transcriptor: la app pide estos valores a /transcriptor-config
+      TRANSCRIPTOR_API_URL: "${TRANSCRIPTOR_API_URL:-}"
+      TRANSCRIPTOR_PUBLIC_URL: "${TRANSCRIPTOR_PUBLIC_URL:-}"
+      TRANSCRIPTOR_API_KEY: "${TRANSCRIPTOR_API_KEY:-}"
     networks:
       - proxy
 

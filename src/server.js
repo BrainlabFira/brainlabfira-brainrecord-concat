@@ -722,6 +722,34 @@ app.get('/download', async (req, res) => {
   }
 });
 
+// ── Configuración del Transcriptor ──────────────────────────────────────────
+// La app pide aquí la URL y la clave de integración en vez de llevarlas
+// embebidas en el instalador, por el mismo motivo que no lleva las de MinIO:
+// una credencial que no hace falta distribuir, no se distribuye.
+//
+// Rotar la clave pasa a ser editar este .env y reiniciar el contenedor, en vez
+// de publicar una versión nueva y esperar a que todos se actualicen.
+const TRANSCRIPTOR_API_URL = process.env.TRANSCRIPTOR_API_URL ?? '';
+const TRANSCRIPTOR_PUBLIC_URL = process.env.TRANSCRIPTOR_PUBLIC_URL ?? '';
+const TRANSCRIPTOR_API_KEY = process.env.TRANSCRIPTOR_API_KEY ?? '';
+
+app.get('/transcriptor-config', async (req, res) => {
+  const profile = await authenticate(req);
+  if (!profile) return res.status(401).json({ error: 'No autenticado' });
+
+  if (!TRANSCRIPTOR_API_URL || !TRANSCRIPTOR_API_KEY) {
+    // 503 y no 500: no es un fallo, es que la transcripción no está
+    // configurada en este servidor. La app lo distingue para avisar bien.
+    return res.status(503).json({ error: 'La transcripción no está configurada en el servidor' });
+  }
+
+  res.json({
+    apiUrl: TRANSCRIPTOR_API_URL,
+    publicUrl: TRANSCRIPTOR_PUBLIC_URL || TRANSCRIPTOR_API_URL,
+    key: TRANSCRIPTOR_API_KEY,
+  });
+});
+
 // Healthcheck
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
