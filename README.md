@@ -170,6 +170,52 @@ a su propia carpeta.
 { "objectName": "6/2026-10-20/rec_20261020_123350/chunk_001.mp4" }
 ```
 
+### `GET /transcriptor-config`
+
+Devuelve la URL y la clave del AI Transcriptor a la app, que **no las lleva
+embebidas**: por el mismo motivo que no lleva las de MinIO, una credencial que
+no hace falta distribuir no se distribuye.
+
+```json
+{
+  "apiUrl": "http://192.168.1.171:18765",
+  "publicUrl": "http://192.168.1.171:18765",
+  "key": "..."
+}
+```
+
+Rotar la clave o cambiar de instancia es editar el `.env` de este servicio y
+reiniciar el contenedor: **no hace falta publicar una versión nueva de la app**.
+
+Si no está configurado responde **503** y la transcripción queda desactivada,
+sin afectar al resto.
+
+### `GET /download`
+
+Entrega el instalador de la última versión, resolviéndolo desde `latest.yml`.
+Es el enlace que se reparte para instalar la app por primera vez.
+
+| Query param | Efecto |
+|---|---|
+| `?key=...` | Clave de descarga (`DOWNLOAD_KEY`), para quien aún no tiene cuenta |
+
+```
+http://192.168.1.175:9210/download?key=<DOWNLOAD_KEY>
+```
+
+Acepta la clave **o** un JWT. El JWT no sirve para la primera instalación: solo
+existe después de instalar la app y hacer login.
+
+No es seguridad real —quien tenga el enlace descarga—, pero el instalador no
+contiene secretos: sin credenciales de la intranet la app no graba, no sube y
+no lee nada. El control de acceso de verdad está en el login.
+
+### `GET /updates/:file`
+
+Sirve el manifiesto (`latest.yml`), los instaladores y los `.blockmap` desde el
+prefijo `releases/`. Lo usa la actualización automática, que ya tiene sesión y
+envía el JWT por cabecera.
+
 ### `GET /health`
 
 Healthcheck. Sin autenticación.
@@ -193,6 +239,9 @@ cp .env.example .env   # y rellenar
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` | Acceso a MinIO |
 | `SUPABASE_URL` / `SUPABASE_ANON_KEY` | Validar los JWT de la app |
 | `ADMIN_ROLE_ID` | `role_id` que puede ver las grabaciones de todos (por defecto `1`) |
+| `DOWNLOAD_KEY` | Clave del enlace de descarga del instalador |
+| `TRANSCRIPTOR_API_URL` / `TRANSCRIPTOR_PUBLIC_URL` | Instancia del Transcriptor que se entrega a las apps |
+| `TRANSCRIPTOR_API_KEY` | Debe valer lo mismo que `BRAINRECORD_API_KEY` en el Transcriptor |
 
 El compose falla al arrancar si falta alguna de las obligatorias, en vez de
 levantar el servicio a medias.
